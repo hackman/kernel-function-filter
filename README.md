@@ -1,36 +1,46 @@
 # kernel-filter
 
-Two Linux kernel modules that force a configurable list of in-kernel
-functions to return `-EPERM` on every call. Useful for ad-hoc kernel-side
-mitigations: disabling a syscall path that has an open CVE, blocking
-kernel functionality without rebuilding the kernel, neutering a problematic 
-driver entry point, etc.
+A small collection of Linux kernel modules for ad-hoc, runtime kernel
+mitigations: disabling syscall paths with open CVEs, blocking subsystems
+without rebuilding the kernel, or back-porting an upstream security fix
+in-place.
 
-The same blocklist concept is implemented two ways:
+Two flavours of each: an **ftrace** version (low-config) and a
+**livepatch** version (cleaner consistency model, can target
+not-yet-loaded modules).
 
-| File | Mechanism | When to prefer |
+| File | Mechanism | Purpose |
 |---|---|---|
-| `filter-functions-ftrace.c` | dynamic ftrace + `FTRACE_OPS_FL_IPMODIFY` | quick, no special kernel config beyond `DYNAMIC_FTRACE` |
-| `filter-functions-livepatch.c` | kernel livepatching (`klp_enable_patch`) | safer transition semantics, patches modules loaded later, requires `CONFIG_LIVEPATCH=y` |
+| `filter-functions-ftrace.c` | dynamic ftrace + `IPMODIFY` | generic: replace a configurable list of functions with `-EPERM` |
+| `filter-functions-livepatch.c` | livepatching | same, but via livepatch |
+| `ptrace-fix-ftrace.c` | dynamic ftrace + `IPMODIFY` | targeted: mitigate the ptrace-after-exit_mm bypass (upstream commit `31e62c2ebbfd`, "ssh-keysign" chain) |
+| `ptrace-fix-livepatch.c` | livepatching | same mitigation, via livepatch |
 
-Both load the same kind of stub: a single `eperm_stub` shared across all
-listed functions, which returns `-EPERM` regardless of the caller's
-arguments.
+The generic blockers (`filter-functions-ftrace.c` / `filter-functions-livepatch.c`) share a
+single `eperm_stub` that returns `-EPERM` regardless of arguments. The
+ptrace mitigations are more surgical — they only force `-EPERM` under
+specific runtime conditions; otherwise the original function runs.
 
 ## Requirements
 
 Common:
-- x86_64 (the stub relies on SysV register ABI for return-value handling)
+- x86_64 (callbacks read `%rdi`/`%rsi` and the stub relies on SysV
+  register ABI for return-value handling)
 - Kernel headers / build tree at `/lib/modules/$(uname -r)/build`
-- Kernel 5.11 or newer (for the `ftrace_regs` API used by both modules)
+- Kernel 4.11 or newer (each source file selects the right API at compile
+  time via `LINUX_VERSION_CODE`; `ftrace_regs` on >=5.11, `klp_register_patch`
+  on <5.1)
 
-ftrace module (`filter-functions-ftrace.c`):
+ftrace modules:
 - `CONFIG_DYNAMIC_FTRACE=y`
 - `CONFIG_FUNCTION_TRACER=y`
+- `CONFIG_DYNAMIC_FTRACE_WITH_REGS=y`
 
-Livepatch module (`filter-functions-livepatch.c`):
+Livepatch modules:
 - `CONFIG_LIVEPATCH=y` (implies `DYNAMIC_FTRACE_WITH_REGS=y` and
   `HAVE_RELIABLE_STACKTRACE=y`)
+- `CONFIG_KPROBES=y` (the ptrace livepatch uses a kprobe to resolve
+  `kallsyms_lookup_name` on >=5.7)
 
 Most stock distro kernels (Debian, Ubuntu, Fedora, RHEL) ship with all
 of these enabled.
@@ -140,14 +150,65 @@ Supported target signatures: anything returning `int`, `long`,
 - Architectures other than x86_64 (the same idea works on arm64 / etc.
   but the stub-return reasoning needs revisiting per ABI)
 
-## Conflicts between the two modules
+## Conflicts between the two mechanisms
 
-Both modules ultimately install an `FTRACE_OPS_FL_IPMODIFY` hook on
+All four modules ultimately install an `FTRACE_OPS_FL_IPMODIFY` hook on
 their target symbols, and only one such hook per function is allowed.
-If you have an active livepatch on `af_alg_sendmsg` and then try to
-load `filter-functions-ftrace.ko` with `af_alg_sendmsg` in its blocklist,
-`register_ftrace_function()` will fail with `-EBUSY`. Pick one
-mechanism per symbol.
+If you have an active livepatch on a function and then try to load an
+ftrace module that touches it, `register_ftrace_function()` will fail
+with `-EBUSY`. In particular, do not load both ptrace mitigations at
+once.
+
+## ptrace exit_mm() dumpability mitigation
+
+`ptrace-fix-ftrace.c` and `ptrace-fix-livepatch.c` back-port a
+mitigation for the bug fixed upstream by commit
+[`31e62c2ebbfd`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=31e62c2ebbfdc3fe3dbdf5e02c92a9dc67087a3a)
+("ptrace: slightly saner 'get_dumpable()' logic"). The original bug:
+`__ptrace_may_access()` did
+
+```c
+mm = task->mm;
+if (mm && ((get_dumpable(mm) != SUID_DUMP_USER) &&
+           !ptrace_has_cap(mm->user_ns, mode)))
+    return -EPERM;
+```
+
+so a target whose `mm` had been torn down by `exit_mm()` silently
+**skipped** the dumpability check — letting an unprivileged tracer
+attach to a previously-non-dumpable exiting task (the Qualys
+ssh-keysign chain).
+
+Upstream caches the pre-exit dumpable state in a new
+`task->user_dumpable:1` bit. **Neither ftrace nor livepatch can extend
+`struct task_struct`**, so these modules apply a stricter mitigation:
+
+> When `task->mm == NULL` and the tracer is not in the same thread
+> group as the target, require `CAP_SYS_PTRACE` in `init_user_ns`.
+
+This matches upstream exactly for kernel threads and for tasks that
+were never dumpable. It is **stricter than upstream** in one narrow
+case: a userspace task whose `mm` has just been torn down and that
+*was* originally `SUID_DUMP_USER` is no longer ptrace-able by its
+non-privileged tracer. Acceptable for a backport; verify in your
+environment before relying on it.
+
+Load:
+
+```sh
+make load-ptrace-ftrace       # or load-ptrace-livepatch
+```
+
+Verify the ftrace version found its target:
+
+```sh
+grep ' __ptrace_may_access$' /proc/kallsyms
+dmesg | tail
+```
+
+If `__ptrace_may_access` is inlined in your kernel, the ftrace version
+will fail to attach — use the livepatch version, which hooks the public
+`ptrace_may_access` instead and delegates internally.
 
 ## Persistence
 
@@ -158,12 +219,14 @@ name to `/etc/modules-load.d/`.
 ## Files
 
 ```
-filter-functions-ftrace.c    ftrace-based blocker, edit blocklist[] at top
-filter-functions-livepatch.c   livepatch-based blocker, edit blocklist[] at top
-Makefile             kbuild + load/unload helpers
-README.md            this file
+filter-functions-ftrace.c        generic ftrace blocker, edit blocklist[] at top
+filter-functions-livepatch.c       generic livepatch blocker, edit blocklist[] at top
+ptrace-fix-ftrace.c      mitigation for commit 31e62c2ebbfd via ftrace
+ptrace-fix-livepatch.c   mitigation for commit 31e62c2ebbfd via livepatch
+Makefile                 kbuild + load/unload helpers
+README.md                this file
 ```
 
 ## License
 
-GPL-2.0
+GPL-2.0.
