@@ -1,5 +1,6 @@
 obj-m := filter-functions-ftrace.o filter-functions-livepatch.o \
-         ptrace-fix-ftrace.o ptrace-fix-livepatch.o
+         ptrace-fix-ftrace.o ptrace-fix-livepatch.o \
+         tcp-connect-logger.o udp-send-logger.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
@@ -10,6 +11,8 @@ FT_MOD          := block_functions
 LP_MOD          := livepatch_filter
 PTRACE_FT_MOD   := ptrace_fix_ftrace
 PTRACE_LP_MOD   := ptrace_fix_livepatch
+TCL_MOD         := tcp_connect_logger
+USL_MOD         := udp_send_logger
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
@@ -49,8 +52,30 @@ unload-ptrace-livepatch:
 	@while [ "$$(cat /sys/kernel/livepatch/$(PTRACE_LP_MOD)/transition 2>/dev/null)" = "1" ]; do sleep 1; done
 	sudo rmmod $(PTRACE_LP_MOD)
 
+# --- tcp_v4_connect logger (LIVEPATCH.md tutorial) -------------------
+load-tcp-logger: all
+	sudo insmod tcp-connect-logger.ko
+
+unload-tcp-logger:
+	echo 0 | sudo tee /sys/kernel/livepatch/$(TCL_MOD)/enabled
+	@echo "Waiting for livepatch transition to complete..."
+	@while [ "$$(cat /sys/kernel/livepatch/$(TCL_MOD)/transition 2>/dev/null)" = "1" ]; do sleep 1; done
+	sudo rmmod $(TCL_MOD)
+
+# --- udp_sendmsg logger (sister to tcp-connect-logger) ---------------
+load-udp-logger: all
+	sudo insmod udp-send-logger.ko
+
+unload-udp-logger:
+	echo 0 | sudo tee /sys/kernel/livepatch/$(USL_MOD)/enabled
+	@echo "Waiting for livepatch transition to complete..."
+	@while [ "$$(cat /sys/kernel/livepatch/$(USL_MOD)/transition 2>/dev/null)" = "1" ]; do sleep 1; done
+	sudo rmmod $(USL_MOD)
+
 .PHONY: all clean \
         load-ftrace unload-ftrace \
         load-livepatch unload-livepatch \
         load-ptrace-ftrace unload-ptrace-ftrace \
-        load-ptrace-livepatch unload-ptrace-livepatch
+        load-ptrace-livepatch unload-ptrace-livepatch \
+        load-tcp-logger unload-tcp-logger \
+        load-udp-logger unload-udp-logger
