@@ -219,12 +219,13 @@ name to `/etc/modules-load.d/`.
 ## Files
 
 ```
-filter-functions-ftrace.c        generic ftrace blocker, edit blocklist[] at top
-filter-functions-livepatch.c       generic livepatch blocker, edit blocklist[] at top
-ptrace-fix-ftrace.c      mitigation for commit 31e62c2ebbfd via ftrace
-ptrace-fix-livepatch.c   mitigation for commit 31e62c2ebbfd via livepatch
-Makefile                 kbuild + load/unload helpers
-README.md                this file
+filter-functions-ftrace.c     generic ftrace function blocker, edit blocklist[] at top
+filter-functions-livepatch.c  generic livepatch function blocker, edit blocklist[] at top
+ptrace-fix-ftrace.c           mitigation for CVE-2026-46333 via ftrace
+ptrace-fix-livepatch.c        mitigation for CVE-2026-46333 via livepatch
+tcp-connect-logger.c          kernel TCP connection logger livepatch
+udp-send-logger.c             kernel UDP "connection" logger livepatch
+Makefile                      kbuild + load/unload helpers
 ```
 
 ## License
